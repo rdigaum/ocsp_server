@@ -1,0 +1,23 @@
+services:
+  ocsp:
+    build: .
+    image: ocsp-test-responder:latest
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./pki:/pki
+    environment:
+      OCSP_HOSTNAME: ${OCSP_HOSTNAME:-ocsp.rdigaum.com.br}
+      OCSP_STRICT_HOST: ${OCSP_STRICT_HOST:-false}
+      OCSP_VALIDITY_SECONDS: ${OCSP_VALIDITY_SECONDS:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PKI_ORG: ${PKI_ORG:-RDigaum Test PKI}
+      PKI_COUNTRY: ${PKI_COUNTRY:-BR}
+      ROOT_CN: ${ROOT_CN:-RDigaum Test Root CA}
+      ICA_CN: ${ICA_CN:-RDigaum Test Issuing CA}
+      OCSP_SIGNER_CN: ${OCSP_SIGNER_CN:-RDigaum Test OCSP Responder}
+      ROOT_DAYS: ${ROOT_DAYS:-7300}
+      ICA_DAYS: ${ICA_DAYS:-3650}
+      OCSP_SIGNER_DAYS: ${OCSP_SIGNER_DAYS:-730}
+      CLIENT_DAYS: ${CLIENT_DAYS:-365}

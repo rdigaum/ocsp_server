@@ -1,0 +1,71 @@
+# Configuração OpenSSL da PKI de teste. Usada pelo pkictl dentro do container;
+# os caminhos apontam para o volume /pki.
+
+[ ca ]
+default_ca = ica_ca
+
+[ root_ca ]
+dir             = /pki/root
+database        = $dir/index.txt
+new_certs_dir   = $dir/newcerts
+certificate     = $dir/root.crt
+private_key     = $dir/root.key
+serial          = $dir/serial
+default_md      = sha256
+default_days    = 3650
+policy          = policy_loose
+unique_subject  = no
+copy_extensions = none
+email_in_dn     = no
+
+[ ica_ca ]
+dir             = /pki/ica
+database        = $dir/index.txt
+new_certs_dir   = $dir/newcerts
+certificate     = $dir/ica.crt
+private_key     = $dir/ica.key
+serial          = $dir/serial
+default_md      = sha256
+default_days    = 365
+policy          = policy_loose
+unique_subject  = no
+copy_extensions = none
+email_in_dn     = no
+
+[ policy_loose ]
+countryName            = optional
+stateOrProvinceName    = optional
+localityName           = optional
+organizationName       = optional
+organizationalUnitName = optional
+commonName             = supplied
+emailAddress           = optional
+
+[ req ]
+distinguished_name = req_dn
+string_mask        = utf8only
+default_md         = sha256
+
+[ req_dn ]
+
+[ v3_root ]
+basicConstraints       = critical, CA:TRUE
+keyUsage               = critical, keyCertSign, cRLSign
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+
+[ v3_ica ]
+basicConstraints       = critical, CA:TRUE, pathlen:0
+keyUsage               = critical, digitalSignature, keyCertSign, cRLSign
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always
+
+# Certificado delegado de assinatura OCSP (RFC 6960 §4.2.2.2), emitido pela ICA.
+# id-pkix-ocsp-nocheck: o cliente não precisa checar revogação do próprio signer.
+[ v3_ocsp ]
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature
+extendedKeyUsage       = critical, OCSPSigning
+noCheck                = ignored
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer

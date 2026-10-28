@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# pkictl — gerencia a PKI de teste (Root CA → ICA → certificados de cliente) e a
+# base de revogação lida pelo OCSP responder. Roda dentro do container; no host,
+# use os wrappers em scripts/.
+set -euo pipefail
+
+PKI_DIR=${PKI_DIR:-/pki}
+CNF=${OPENSSL_CNF:-/opt/ocsp/openssl.cnf}
+# Hostname do OCSP responder — mesmo valor usado pelo servidor; gravado no AIA
+# dos certificados de cliente como http://<hostname>.
+OCSP_HOSTNAME=${OCSP_HOSTNAME:-ocsp.rdigaum.com.br}
+OCSP_URL=http://$OCSP_HOSTNAME
+CHECK_URL=${CHECK_URL:-http://ocsp:80}
+
+PKI_ORG=${PKI_ORG:-RDigaum Test PKI}
+PKI_COUNTRY=${PKI_COUNTRY:-BR}
+ROOT_CN=${ROOT_CN:-RDigaum Test Root CA}
+ICA_CN=${ICA_CN:-RDigaum Test Issuing CA}
+OCSP_SIGNER_CN=${OCSP_SIGNER_CN:-RDigaum Test OCSP Responder}
+ROOT_DAYS=${ROOT_DAYS:-7300}
+ICA_DAYS=${ICA_DAYS:-3650}
+OCSP_SIGNER_DAYS=${OCSP_SIGNER_DAYS:-730}
+CLIENT_DAYS=${CLIENT_DAYS:-365}
+
+ROOT=$PKI_DIR/root
+ICA=$PKI_DIR/ica
+SIGNER=$PKI_DIR/ocsp
+CLIENTS=$PKI_DIR/clients
+INDEX=$ICA/index.txt
+
+REASONS="unspecified keyCompromise CACompromise affiliationChanged superseded cessationOfOperation certificateHold"
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+die() { echo "erro: $*" >&2; exit 1; }
+info() { echo ">> $*"; }
+
+usage() {
+  cat <<EOF
+Uso: pkictl <comando> [opções]
+
+  init [--force]                 cria Root CA, ICA e certificado do OCSP signer
+  issue <nome> [opções]          emite certificado de cliente (AIA OCSP = $OCSP_URL)
+        --cn <CN>                  Common Name (padrão: <nome>)
+        --email <email>            SAN rfc822Name (repetível)
+        --dns <host>               SAN dNSName (repetível)
+        --days <n>                 validade em dias (padrão: $CLIENT_DAYS)
+        --ec                       chave EC P-256 (padrão: RSA 2048)
+        --p12-pass <senha>         senha do .p12 (padrão: changeit)
+  revoke <alvo> [motivo]         revoga; motivo: ${REASONS// /, }
+  unrevoke <alvo>                remove a revogação (volta a "good")
+  list                           lista certificados emitidos pela ICA
+  show <alvo>                    exibe o certificado
+  check <alvo> [--get] [--url U] consulta o OCSP responder (POST, ou GET com --get)
+
+<alvo> = nome do cliente, serial em hex, ou caminho de um .crt
+EOF
+}
+
+require_pki() {
+  [[ -f $ICA/ica.crt && -f $SIGNER/ocsp.crt ]] || die "PKI não inicializada — rode: pkictl init"
+}
+
+genkey() {  # genkey <arquivo> <rsa:bits|ec>
+  case $2 in
+    ec) openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null ;;
+    rsa:*) openssl genpkey -algorithm RSA -pkeyopt "rsa_keygen_bits:${2#rsa:}" -out "$1" 2>/dev/null ;;
+  esac
+  chmod 600 "$1"
+}
+
+init_ca_dir() {
+  mkdir -p "$1/newcerts"
+  : > "$1/index.txt"
+  echo "unique_subject = no" > "$1/index.txt.attr"
+  openssl rand -hex 16 > "$1/serial"
+}
+
+cmd_init() {
+  if [[ -f $ROOT/root.crt ]]; then
+    [[ ${1:-} == --force ]] || die "PKI já existe em $PKI_DIR (use --force para recriar TUDO, inclusive clientes)"
+    rm -rf "$ROOT" "$ICA" "$SIGNER" "$CLIENTS"
+  fi
+  init_ca_dir "$ROOT"
+  init_ca_dir "$ICA"
+  mkdir -p "$SIGNER" "$CLIENTS"
+
+  info "Root CA: $ROOT_CN"
+  genkey "$ROOT/root.key" rsa:4096
+  openssl req -config "$CNF" -new -x509 -key "$ROOT/root.key" -days "$ROOT_DAYS" \
+    -subj "/C=$PKI_COUNTRY/O=$PKI_ORG/CN=$ROOT_CN" -extensions v3_root -out "$ROOT/root.crt"
+
+  info "ICA: $ICA_CN"
+  genkey "$ICA/ica.key" rsa:4096
+  openssl req -config "$CNF" -new -key "$ICA/ica.key" \
+    -subj "/C=$PKI_COUNTRY/O=$PKI_ORG/CN=$ICA_CN" -out "$ICA/ica.csr"
+  openssl ca -config "$CNF" -name root_ca -batch -notext -rand_serial -days "$ICA_DAYS" \
+    -extensions v3_ica -in "$ICA/ica.csr" -out "$ICA/ica.crt" 2>/dev/null
+  cat "$ICA/ica.crt" "$ROOT/root.crt" > "$ICA/chain.crt"
+
+  info "OCSP signer: $OCSP_SIGNER_CN"
+  genkey "$SIGNER/ocsp.key" rsa:2048
+  openssl req -config "$CNF" -new -key "$SIGNER/ocsp.key" \
+    -subj "/C=$PKI_COUNTRY/O=$PKI_ORG/CN=$OCSP_SIGNER_CN" -out "$SIGNER/ocsp.csr"
+  openssl ca -config "$CNF" -name ica_ca -batch -notext -rand_serial -days "$OCSP_SIGNER_DAYS" \
+    -extensions v3_ocsp -in "$SIGNER/ocsp.csr" -out "$SIGNER/ocsp.crt" 2>/dev/null
+
+  openssl verify -CAfile "$ROOT/root.crt" -untrusted "$ICA/ica.crt" "$SIGNER/ocsp.crt" >/dev/null
+  info "PKI criada em $PKI_DIR"
+  echo "   Root CA : $ROOT/root.crt"
+  echo "   ICA     : $ICA/ica.crt"
+  echo "   Cadeia  : $ICA/chain.crt (ICA + Root)"
+}
+
+cmd_issue() {
+  require_pki
+  local name=${1:-}; shift || true
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "nome inválido (use letras, números, . _ -)"
+  local cn=$name days=$CLIENT_DAYS keyalg=rsa:2048 p12pass=changeit
+  local -a sans=()
+  while (($#)); do
+    case $1 in
+      --cn) cn=$2; shift 2 ;;
+      --email) sans+=("email:$2"); shift 2 ;;
+      --dns) sans+=("DNS:$2"); shift 2 ;;
+      --days) days=$2; shift 2 ;;
+      --ec) keyalg=ec; shift ;;
+      --p12-pass) p12pass=$2; shift 2 ;;
+      *) die "opção desconhecida: $1" ;;
+    esac
+  done
+
+  local dir=$CLIENTS/$name
+  [[ ! -e $dir ]] || die "cliente '$name' já existe ($dir)"
+  mkdir -p "$dir"
+  local tmp=$WORK
+
+  {
+    echo "[ client_ext ]"
+    echo "basicConstraints       = critical, CA:FALSE"
+    if [[ $keyalg == ec ]]; then
+      echo "keyUsage               = critical, digitalSignature"
+    else
+      echo "keyUsage               = critical, digitalSignature, keyEncipherment"
+    fi
+    echo "extendedKeyUsage       = clientAuth"
+    echo "subjectKeyIdentifier   = hash"
+    echo "authorityKeyIdentifier = keyid,issuer"
+    echo "authorityInfoAccess    = OCSP;URI:$OCSP_URL"
+    if ((${#sans[@]})); then
+      local IFS=,
+      echo "subjectAltName         = ${sans[*]}"
+    fi
+  } > "$tmp/ext.cnf"
+
+  genkey "$dir/$name.key" "$keyalg"
+  openssl req -config "$CNF" -new -key "$dir/$name.key" \
+    -subj "/C=$PKI_COUNTRY/O=$PKI_ORG/OU=Clientes/CN=$cn" -out "$tmp/req.csr"
+  openssl ca -config "$CNF" -name ica_ca -batch -notext -rand_serial -days "$days" \
+    -extfile "$tmp/ext.cnf" -extensions client_ext -in "$tmp/req.csr" -out "$dir/$name.crt" 2>/dev/null
+  cat "$dir/$name.crt" "$ICA/ica.crt" > "$dir/$name-chain.crt"
+  openssl pkcs12 -export -inkey "$dir/$name.key" -in "$dir/$name.crt" -certfile "$ICA/chain.crt" \
+    -name "$cn" -passout "pass:$p12pass" -out "$dir/$name.p12"
+
+  local serial; serial=$(openssl x509 -in "$dir/$name.crt" -noout -serial | cut -d= -f2)
+  info "certificado emitido: $name (serial $serial)"
+  echo "   $dir/$name.crt | .key | -chain.crt | .p12 (senha: $p12pass)"
+  openssl x509 -in "$dir/$name.crt" -noout -ext authorityInfoAccess,subjectAltName 2>/dev/null | sed 's/^/   /'
+}
+
+# Resolve <alvo> → serial em hex no formato do index.txt (maiúsculo).
+resolve_serial() {
+  local target=${1:-} crt=""
+  [[ -n $target ]] || die "informe o alvo (nome do cliente, serial ou arquivo .crt)"
+  if [[ -f $target ]]; then crt=$target
+  elif [[ -f $CLIENTS/$target/$target.crt ]]; then crt=$CLIENTS/$target/$target.crt
+  fi
+  local serial
+  if [[ -n $crt ]]; then
+    serial=$(openssl x509 -in "$crt" -noout -serial | cut -d= -f2)
+  else
+    serial=$(echo "$target" | tr -d ':' | sed 's/^0[xX]//' | tr 'a-f' 'A-F')
+    [[ $serial =~ ^[0-9A-F]+$ ]] || die "'$target' não é cliente conhecido nem serial hex"
+  fi
+  # o index guarda o serial com número par de dígitos; normaliza removendo zeros à esquerda
+  local match
+  match=$(awk -F'\t' -v s="$serial" 'function n(x){sub(/^0+/,"",x); return x} n($4)==n(s){print $4; exit}' "$INDEX")
+  [[ -n $match ]] || die "serial $serial não encontrado na base da ICA"
+  echo "$match"
+}
+
+cert_file() { echo "$ICA/newcerts/$1.pem"; }
+index_status() { awk -F'\t' -v s="$1" '$4==s{print $1; exit}' "$INDEX"; }
+
+cmd_revoke() {
+  require_pki
+  local serial reason=${2:-unspecified}
+  serial=$(resolve_serial "${1:-}")
+  [[ " $REASONS " == *" $reason "* ]] || die "motivo inválido '$reason' (válidos: $REASONS)"
+  [[ $(index_status "$serial") != R ]] || die "serial $serial já está revogado"
+  openssl ca -config "$CNF" -name ica_ca -revoke "$(cert_file "$serial")" -crl_reason "$reason" 2>/dev/null
+  info "revogado: serial $serial (motivo: $reason)"
+}
+
+cmd_unrevoke() {
+  require_pki
+  local serial; serial=$(resolve_serial "${1:-}")
+  [[ $(index_status "$serial") == R ]] || die "serial $serial não está revogado"
+  awk -F'\t' -v OFS='\t' -v s="$serial" '$4==s && $1=="R" {$1="V"; $3=""} {print}' "$INDEX" > "$WORK/index.txt"
+  # reescreve no mesmo inode (seguro para bind mounts); o responder recarrega pelo mtime
+  cat "$WORK/index.txt" > "$INDEX"
+  info "revogação removida: serial $serial (volta a responder good)"
+}
+
+cmd_list() {
+  require_pki
+  printf "%-8s %-42s %-15s %-30s %s\n" STATUS SERIAL EXPIRA REVOGADO SUBJECT
+  awk -F'\t' '{
+    st = ($1=="V") ? "good" : ($1=="R") ? "revoked" : ($1=="E") ? "expired" : $1
+    printf "%-8s %-42s %-15s %-30s %s\n", st, $4, $2, ($3=="" ? "-" : $3), $6
+  }' "$INDEX"
+}
+
+cmd_show() {
+  require_pki
+  local serial; serial=$(resolve_serial "${1:-}")
+  openssl x509 -in "$(cert_file "$serial")" -noout -text
+}
+
+cmd_check() {
+  require_pki
+  local target=${1:-}; shift || true
+  local mode=post url=$CHECK_URL
+  while (($#)); do
+    case $1 in
+      --get) mode=get; shift ;;
+      --url) url=$2; shift 2 ;;
+      *) die "opção desconhecida: $1" ;;
+    esac
+  done
+  local serial crt host=$OCSP_HOSTNAME
+  serial=$(resolve_serial "$target")
+  crt=$(cert_file "$serial")
+  info "consultando $url ($mode, Host: $host) — serial $serial"
+
+  if [[ $mode == post ]]; then
+    openssl ocsp -issuer "$ICA/ica.crt" -cert "$crt" -url "$url" -header "Host=$host" \
+      -CAfile "$ROOT/root.crt" -verify_other "$ICA/ica.crt" -resp_text \
+      | grep -E $'Responder Error|Response verify|Responder Id|Revocation Reason|: (good|revoked|unknown)$|^\t' || true
+  else
+    local tmp=$WORK
+    openssl ocsp -issuer "$ICA/ica.crt" -cert "$crt" -no_nonce -reqout "$tmp/req.der" >/dev/null
+    local b64; b64=$(base64 -w0 "$tmp/req.der" | sed 's#+#%2B#g; s#/#%2F#g; s#=#%3D#g')
+    curl -fsS -H "Host: $host" -D "$tmp/headers" -o "$tmp/resp.der" "$url/$b64"
+    grep -iE '^(content-type|cache-control|expires)' "$tmp/headers" | sed 's/^/   /'
+    openssl ocsp -respin "$tmp/resp.der" -issuer "$ICA/ica.crt" -cert "$crt" \
+      -CAfile "$ROOT/root.crt" -verify_other "$ICA/ica.crt" -resp_text \
+      | grep -E $'Responder Error|Response verify|Responder Id|Revocation Reason|: (good|revoked|unknown)$|^\t' || true
+  fi
+}
+
+cmd=${1:-help}; shift || true
+case $cmd in
+  init) cmd_init "$@" ;;
+  issue) cmd_issue "$@" ;;
+  revoke) cmd_revoke "$@" ;;
+  unrevoke) cmd_unrevoke "$@" ;;
+  list) cmd_list "$@" ;;
+  show) cmd_show "$@" ;;
+  check) cmd_check "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
