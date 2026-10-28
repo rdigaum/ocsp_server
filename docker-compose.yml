@@ -2,6 +2,7 @@ services:
   ocsp:
     build: .
     image: ocsp-test-responder:latest
+    pull_policy: never   # imagem local: construída pelo compose, nunca baixada do registry
     restart: unless-stopped
     ports:
       - "${HTTP_PORT:-80}:80"
@@ -9,6 +10,7 @@ services:
       - ./pki:/pki
     environment:
       OCSP_HOSTNAME: ${OCSP_HOSTNAME:-ocsp.rdigaum.com.br}
+      OCSP_PATH: ${OCSP_PATH:-/ocsp/validation}
       OCSP_STRICT_HOST: ${OCSP_STRICT_HOST:-false}
       OCSP_VALIDITY_SECONDS: ${OCSP_VALIDITY_SECONDS:-300}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

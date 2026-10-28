@@ -5,10 +5,10 @@ e responde good / revoked / unknown. A base e os certificados são recarregados
 automaticamente quando os arquivos mudam no disco — revogar / desrevogar via
 `pkictl` reflete na próxima consulta, sem reiniciar o serviço.
 
-Aceita:
-  POST /                 body DER, Content-Type: application/ocsp-request
-  GET  /<base64(DER)>    RFC 6960 Apêndice A.1 (URL-encoded)
-  GET  /health           healthcheck
+Aceita (OCSP_PATH, padrão /ocsp/validation):
+  POST <OCSP_PATH>                body DER, Content-Type: application/ocsp-request
+  GET  <OCSP_PATH>/<base64(DER)>  RFC 6960 Apêndice A.1 (URL-encoded)
+  GET  /health                    healthcheck
 """
 
 import base64
@@ -16,6 +16,7 @@ import datetime as dt
 import hashlib
 import logging
 import os
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
@@ -35,6 +36,13 @@ SIGNER_KEY = os.path.join(PKI_DIR, "ocsp", "ocsp.key")
 # OCSP_STRICT_HOST=true, recebem "unauthorized".
 OCSP_HOSTNAME = os.environ.get("OCSP_HOSTNAME", "ocsp.rdigaum.com.br").strip().lower()
 STRICT_HOST = os.environ.get("OCSP_STRICT_HOST", "false").strip().lower() in ("1", "true", "yes")
+# Path do endpoint OCSP — o mesmo gravado no AIA (http://<hostname><path>).
+# POST em <path>, GET em <path>/<base64>. "/" = raiz.
+OCSP_PATH = "/" + os.environ.get("OCSP_PATH", "/ocsp/validation").strip().strip("/")
+OCSP_PREFIX = OCSP_PATH.rstrip("/")  # "" quando o path é a raiz
+if not re.fullmatch(r"(/[A-Za-z0-9._~-]+)*", OCSP_PREFIX):
+    raise SystemExit(f"OCSP_PATH inválido: {OCSP_PATH!r}")
+OCSP_URI = f"http://{OCSP_HOSTNAME}{OCSP_PREFIX}"
 LISTEN_ADDR = os.environ.get("LISTEN_ADDR", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "80"))
 # Janela thisUpdate → nextUpdate. Também define o Cache-Control enviado ao cliente
@@ -205,8 +213,8 @@ def _unsuccessful(status):
     return ocsp.OCSPResponseBuilder.build_unsuccessful(status).public_bytes(serialization.Encoding.DER)
 
 
-def _decode_get_path(path):
-    raw = unquote(path.lstrip("/"))
+def _decode_get_path(encoded):
+    raw = unquote(encoded)
     raw = raw.replace("-", "+").replace("_", "/")  # tolera base64url
     raw += "=" * (-len(raw) % 4)
     return base64.b64decode(raw, validate=True)
@@ -221,16 +229,22 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/health", "/healthz"):
             return self._send(200, b"ok\n", "text/plain")
-        if path == "/":
-            msg = f"OCSP responder http://{OCSP_HOSTNAME} - envie POST application/ocsp-request\n"
+        if path in ("/", OCSP_PREFIX, OCSP_PREFIX + "/"):
+            msg = f"OCSP responder {OCSP_URI} - envie POST application/ocsp-request\n"
             return self._send(200, msg.encode(), "text/plain")
+        # GET <path>/<base64>: o base64 pode conter "/", então tudo após o prefixo é o pedido
+        if not path.startswith(OCSP_PREFIX + "/"):
+            return self._not_found(path)
         try:
-            der = _decode_get_path(path)
+            der = _decode_get_path(path[len(OCSP_PREFIX) + 1:])
         except ValueError:
             return self._ocsp_reply(_unsuccessful(ocsp.OCSPResponseStatus.MALFORMED_REQUEST), None, "GET base64 inválido")
         self._handle(der)
 
     def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path.rstrip("/") != OCSP_PREFIX:
+            return self._not_found(path)
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > MAX_REQUEST_BYTES:
             return self._ocsp_reply(_unsuccessful(ocsp.OCSPResponseStatus.MALFORMED_REQUEST), None, f"POST tamanho inválido ({length})")
@@ -249,6 +263,13 @@ class Handler(BaseHTTPRequestHandler):
         if not host_ok:
             desc += " host_mismatch"
         self._ocsp_reply(body, next_update, desc)
+
+    def _not_found(self, path):
+        log.info("%s %s path=%s 404 (endpoint OCSP: %s)", self.command, self._client(), path, OCSP_PATH)
+        # o corpo de um POST não foi lido — encerra a conexão para não corromper o keep-alive
+        self.close_connection = True
+        self._send(404, f"not found - endpoint OCSP: {OCSP_PATH}\n".encode(), "text/plain",
+                   {"Connection": "close"})
 
     def _request_host(self):
         host = (self.headers.get("Host") or "").strip().lower()
@@ -295,8 +316,8 @@ def main():
     STATE.refresh()
     server = ThreadingHTTPServer((LISTEN_ADDR, LISTEN_PORT), Handler)
     server.daemon_threads = True
-    log.info("OCSP responder http://%s em %s:%d (validade %ss, strict_host=%s)",
-             OCSP_HOSTNAME, LISTEN_ADDR, LISTEN_PORT, VALIDITY_SECONDS, STRICT_HOST)
+    log.info("OCSP responder %s em %s:%d (validade %ss, strict_host=%s)",
+             OCSP_URI, LISTEN_ADDR, LISTEN_PORT, VALIDITY_SECONDS, STRICT_HOST)
     server.serve_forever()
 
 

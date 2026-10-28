@@ -6,11 +6,15 @@ set -euo pipefail
 
 PKI_DIR=${PKI_DIR:-/pki}
 CNF=${OPENSSL_CNF:-/opt/ocsp/openssl.cnf}
-# Hostname do OCSP responder — mesmo valor usado pelo servidor; gravado no AIA
-# dos certificados de cliente como http://<hostname>.
+# Hostname e path do OCSP responder — mesmos valores usados pelo servidor; gravados
+# no AIA dos certificados de cliente como http://<hostname><path>.
 OCSP_HOSTNAME=${OCSP_HOSTNAME:-ocsp.rdigaum.com.br}
-OCSP_URL=http://$OCSP_HOSTNAME
-CHECK_URL=${CHECK_URL:-http://ocsp:80}
+OCSP_PATH=${OCSP_PATH:-/ocsp/validation}
+OCSP_PATH=/${OCSP_PATH#/}; OCSP_PATH=${OCSP_PATH%/}   # "/x/y/" -> "/x/y"; "/" -> ""
+[[ $OCSP_PATH =~ ^(/[A-Za-z0-9._~-]+)*$ ]] || { echo "erro: OCSP_PATH inválido: '$OCSP_PATH'" >&2; exit 1; }
+OCSP_URL=http://$OCSP_HOSTNAME$OCSP_PATH
+# URL usada pelo "check" (rede interna do compose); --url sobrescreve com uma URL completa
+CHECK_URL=${CHECK_URL:-http://ocsp:80$OCSP_PATH}
 
 PKI_ORG=${PKI_ORG:-RDigaum Test PKI}
 PKI_COUNTRY=${PKI_COUNTRY:-BR}
@@ -53,6 +57,7 @@ Uso: pkictl <comando> [opções]
   list                           lista certificados emitidos pela ICA
   show <alvo>                    exibe o certificado
   check <alvo> [--get] [--url U] consulta o OCSP responder (POST, ou GET com --get)
+                                 --url: URL completa, com path (padrão: $CHECK_URL)
 
 <alvo> = nome do cliente, serial em hex, ou caminho de um .crt
 EOF
